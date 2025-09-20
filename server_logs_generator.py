@@ -14,6 +14,7 @@ import time
 from typing import Dict, Any
 
 from response_pool import get_pool
+from datetime import datetime, timezone
 
 
 def process_option(_option: Dict[str, Any]) -> None:
@@ -32,11 +33,16 @@ def main() -> None:
     try:
         while True:
             option = random.choice(pool)
-            print(json.dumps(option, ensure_ascii=False))
+
+            # Agregar timestamp actual en UTC en formato ISO-8601
+            timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            event = {**option, "timestamp": timestamp}
+
+            print(json.dumps(event, ensure_ascii=False))
             sys.stdout.flush()
 
             # Hook para procesamiento adicional (por ahora no-op)
-            process_option(option)
+            process_option(event)
 
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
