@@ -2,7 +2,8 @@
 ## Samuel Rendón Trujillo
 
 Este documento describe paso a paso la construcción de **dos escenarios de pipelines en AWS** para procesar eventos en tiempo real.
-Link video: 
+
+### Link video: 
 
 ---
 
