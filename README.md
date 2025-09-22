@@ -1,18 +1,16 @@
-# Reto 2 - Pipeline Server Logs → Kinesis → Lambda → DynamoDB
+# Reto 2 - Procesamiento de Flujos con AWS
 
-Este documento describe paso a paso la construcción de un pipeline en AWS que procesa eventos de logs HTTP en tiempo real.  
-El flujo implementado es:
-
-```
-Server Logs (Python producer) → Kinesis Data Stream → AWS Lambda → DynamoDB
-```
+Este documento describe paso a paso la construcción de **dos escenarios de pipelines en AWS** para procesar eventos en tiempo real.
 
 ---
+
+# Escenario 1: Server Logs → Kinesis Data Stream → AWS Lambda → DynamoDB
+
+Este primer escenario implementa un pipeline básico de ingestión y persistencia de eventos en DynamoDB.
 
 ## 1. Preparación del entorno
 
 ### Variables de entorno
-Definir variables comunes para evitar repetir valores:
 
 ```bash
 export REGION=us-east-1
@@ -22,6 +20,7 @@ export LAMBDA_FUNC=KinesisToDynamo
 ```
 
 ### Dependencias en CloudShell / EC2
+
 ```bash
 sudo yum update -y
 sudo yum install -y python3-pip jq
@@ -148,7 +147,8 @@ python3 producer.py
 
 ## 7. Validación del pipeline
 
-### Verificar en Kinesis (lectura de records):
+### Verificar en Kinesis
+
 ```bash
 export SHARD_ID=$(aws kinesis list-shards   --region $REGION --stream-name $STREAM   --query 'Shards[0].ShardId' --output text)
 
@@ -157,41 +157,26 @@ export ITER=$(aws kinesis get-shard-iterator   --region $REGION   --stream-name 
 aws kinesis get-records --region $REGION --shard-iterator $ITER --limit 5
 ```
 
-### Verificar logs de Lambda:
+### Verificar logs de Lambda
+
 ```bash
 aws logs filter-log-events   --region $REGION   --log-group-name "/aws/lambda/$LAMBDA_FUNC"   --start-time $(($(date +%s) * 1000 - 5 * 60 * 1000))   --limit 20
 ```
 
-### Verificar en DynamoDB:
+### Verificar en DynamoDB
+
 ```bash
 aws dynamodb scan   --region $REGION   --table-name $TABLE   --limit 5
-```
-
-O consulta por rango de timestamp:
-
-```bash
-aws dynamodb query   --region $REGION   --table-name $TABLE   --key-condition-expression "pk = :p AND sk BETWEEN :a AND :b"   --expression-attribute-values '{
-    ":p": {"S":"path#/static/logo.png"},
-    ":a": {"S":"2025-09-20T00:00:00.000Z"},
-    ":b": {"S":"2025-09-20T23:59:59.999Z"}
-  }'
 ```
 
 ---
 
 ## 8. Limpieza de recursos
 
-Cuando termines el laboratorio, elimina recursos para evitar costos:
-
 ```bash
 aws dynamodb delete-table --region $REGION --table-name $TABLE
 aws kinesis delete-stream --region $REGION --stream-name $STREAM --enforce-deletion
 aws lambda delete-function --region $REGION --function-name $LAMBDA_FUNC
-```
-
-Si creaste una instancia EC2:
-```bash
-aws ec2 terminate-instances --region $REGION --instance-ids $INSTANCE_ID
 ```
 
 ---
@@ -209,4 +194,113 @@ aws ec2 terminate-instances --region $REGION --instance-ids $INSTANCE_ID
                                                         | DynamoDB Table    |
                                                         |   HttpRequests    |
                                                         +-------------------+
+```
+
+---
+
+# Escenario 2: Server Logs → Kinesis Data Stream → Kinesis Data Analytics (Flink/SQL) → Kinesis Data Stream → Lambda → SNS (SMS)
+
+En este escenario se extiende el pipeline para implementar una aplicación **event-driven** que detecta inventario bajo y envía notificaciones vía **SNS (SMS)**.
+
+## 1. Crear stream de salida (alertas)
+
+```bash
+export STREAM_OUT=alerts-low-inventory
+
+aws kinesis create-stream   --region $REGION   --stream-name $STREAM_OUT   --shard-count 1
+
+aws kinesis wait stream-exists --region $REGION --stream-name $STREAM_OUT
+```
+
+---
+
+## 2. Crear aplicación de Kinesis Data Analytics
+
+1. Ir a **Kinesis Data Analytics** en la consola.  
+2. Crear aplicación tipo **SQL (Flink SQL)**.  
+3. Fuente: stream de entrada (`http-requests`).  
+4. Destino: stream de salida (`alerts-low-inventory`).  
+5. Asignar un bucket de S3 para estado y un rol IAM (ej: `LabRole`).  
+
+### SQL de ejemplo (inventario bajo)
+
+```sql
+CREATE OR REPLACE STREAM DESTINATION_SQL_STREAM (
+  product_id VARCHAR(64),
+  inventory INTEGER,
+  ts TIMESTAMP,
+  reason VARCHAR(32)
+);
+
+CREATE OR REPLACE PUMP STREAM_PUMP AS
+INSERT INTO DESTINATION_SQL_STREAM
+SELECT product_id, inventory, ts, 'LOW_STOCK'
+FROM SOURCE_SQL_STREAM_001
+WHERE type = 'inventory' AND inventory < 10;
+```
+
+---
+
+## 3. Validar salida en el nuevo stream
+
+```bash
+export SHARD_ID=$(aws kinesis list-shards   --region $REGION --stream-name $STREAM_OUT   --query 'Shards[0].ShardId' --output text)
+
+export ITER=$(aws kinesis get-shard-iterator   --region $REGION   --stream-name $STREAM_OUT   --shard-id $SHARD_ID   --shard-iterator-type TRIM_HORIZON   --query 'ShardIterator' --output text)
+
+aws kinesis get-records --region $REGION --shard-iterator $ITER --limit 5
+```
+
+---
+
+## 4. Conectar salida con Lambda y SNS
+
+1. Crear **SNS Topic** y suscribir número de teléfono (SMS).  
+2. Crear **Lambda** que consuma de `alerts-low-inventory` y publique en SNS:
+
+```python
+import os, json, base64, boto3
+sns = boto3.client("sns")
+TOPIC_ARN = os.environ["TOPIC_ARN"]
+
+def lambda_handler(event, context):
+    for rec in event["Records"]:
+        payload = base64.b64decode(rec["kinesis"]["data"])
+        evt = json.loads(payload)
+        msg = f"ALERTA: {evt['product_id']} bajo inventario ({evt['inventory']})"
+        sns.publish(TopicArn=TOPIC_ARN, Message=msg)
+    return {"status": "ok"}
+```
+
+3. Asociar Lambda al stream `alerts-low-inventory` con un Event Source Mapping.  
+
+---
+
+## 5. Limpieza de recursos
+
+```bash
+aws kinesis delete-stream --region $REGION --stream-name $STREAM_OUT --enforce-deletion
+# También eliminar aplicación de Kinesis Data Analytics, Lambda y SNS Topic creados
+```
+
+---
+
+## 6. Diagrama del flujo
+
+```
++------------------+        +---------------------+        +---------------------------+
+|  Python Producer | -----> | Kinesis Data Stream | -----> | Kinesis Data Analytics    |
+| (Server Logs)    |        |  (http-requests)    |        | (SQL/Flink - detecta low) |
++------------------+        +---------------------+        +---------------------------+
+                                                                       |
+                                                                       v
+                                                         +----------------------------+
+                                                         | Kinesis Data Stream (out)  |
+                                                         |  alerts-low-inventory      |
+                                                         +----------------------------+
+                                                                       |
+                                                                       v
+                                                         +----------------------------+
+                                                         | AWS Lambda → SNS (SMS)     |
+                                                         +----------------------------+
 ```
